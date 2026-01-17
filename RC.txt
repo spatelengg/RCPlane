@@ -1,0 +1,248 @@
+// RP2040 Zero RC Receiver
+// - Radio: nRF24L01 on custom SPI pins
+// - Motors: Dual coreless via DRV8833 on GP14/15 and GP26/27
+// - Servo signal on GP13 (make sure servo power is appropriate!)
+// - Battery: 1S LiPo with firmware Low-Voltage Cutoff using ADC on GP28
+//
+// Core: Arduino-Pico (Earle Philhower)
+// Libraries: RF24 by TMRh20, Servo (standard)
+//
+// NOTE on power:
+// • If powering the RP2040 Zero from LiPo into 5V pin, add a series Schottky diode to prevent USB backfeed.
+// • Add LVC in firmware AND consider a buck/boost to keep 3.3 V stable if you see brownouts.
+// • nRF24L01 MUST be on 3.3 V with local 0.1 µF + 10 µF at the module.
+// • DRV8833 VM from LiPo, with 470–1000 µF bulk cap near VM/GND.
+// • Servo power: many hobby servos need 4.8–6 V. If your servo isn’t rated for 3.7–4.2 V, use a 5 V boost for the servo’s V+.
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <RF24.h>
+#include <Servo.h>
+
+/************** Pin Map **************/
+// nRF24L01 (SPI)
+static const uint8_t PIN_SCK  = 2;   // GP2
+static const uint8_t PIN_MOSI = 3;   // GP3
+static const uint8_t PIN_MISO = 4;   // GP4
+static const uint8_t PIN_CSN  = 5;   // GP5 (CSN)
+static const uint8_t PIN_CE   = 6;   // GP6 (CE)
+
+// DRV8833
+static const uint8_t AIN1 = 14;  // GP14
+static const uint8_t AIN2 = 15;  // GP15
+static const uint8_t BIN1 = 26;  // GP26
+static const uint8_t BIN2 = 27;  // GP27
+
+// Servo signal
+static const uint8_t SERVO_PIN = 13; // GP13 (signal only)
+
+// Battery sense
+static const uint8_t VBAT_ADC_PIN = 28; // GP28 / ADC2
+
+/************** Config **************/
+// Radio pipe address (5 bytes). Change both TX and RX to match.
+const byte RADIO_ADDR[6] = "RC001"; // 5 chars + null (RF24 uses 5)
+
+// PWM
+static const uint32_t PWM_FREQ_HZ = 20000; // 20 kHz (quiet for brushed motors)
+static const uint16_t PWM_MAX = 255;       // Arduino-Pico analogWrite range default 0-255
+
+// Battery thresholds (under load)
+static const float VBAT_WARN_V = 3.50f;  // begin limiting / warn
+static const float VBAT_CUTOFF_V = 3.30f; // hard cutoff/disarm
+static const float VBAT_REARM_V = 3.40f;  // hysteresis to rearm after cutoff
+
+// Failsafe
+static const uint32_t RADIO_TIMEOUT_MS = 200; // if no packet in this time -> failsafe
+
+// Throttle ramp to limit current spikes
+static const uint8_t RAMP_STEP = 3;      // PWM steps per loop
+static const uint32_t RAMP_INTERVAL_MS = 5; // ramp timing
+
+// Servo range
+static const int SERVO_MIN_US = 1000;
+static const int SERVO_MAX_US = 2000;
+
+/************** Types **************/
+struct RxPacket {
+  uint8_t thrL;   // 0..255 left motor
+  uint8_t thrR;   // 0..255 right motor
+  uint8_t servo;  // 0..255 (map to 1000..2000us)
+  uint8_t flags;  // bits: 0=arm, 1=mode, etc.
+  uint8_t crc;    // simple XOR or sum
+};
+
+/************** Globals **************/
+RF24 radio(PIN_CE, PIN_CSN);
+Servo servo1;
+
+volatile bool armed = false;
+bool lowBatteryLockout = false;
+
+uint32_t lastRxMs = 0;
+uint32_t lastRampMs = 0;
+uint32_t lastVbatReadMs = 0;
+
+uint8_t cmdThrL = 0, cmdThrR = 0;   // commanded from radio
+uint8_t pwmL = 0, pwmR = 0;         // ramped outputs
+
+/************** Helpers **************/
+static inline uint8_t simpleCRC(const RxPacket &p) {
+  uint8_t c = 0;
+  c ^= p.thrL; c ^= p.thrR; c ^= p.servo; c ^= p.flags; c ^= 0xA5;
+  return c;
+}
+
+void setMotorAB(int mA, int mB) {
+  // mA/mB = -255..+255 (sign = direction)
+  auto driveOne = [](uint8_t in1, uint8_t in2, int val){
+    val = constrain(val, -((int)PWM_MAX), (int)PWM_MAX);
+    if (val >= 0) {
+      analogWrite(in1, val);
+      analogWrite(in2, 0);
+    } else {
+      analogWrite(in1, 0);
+      analogWrite(in2, -val);
+    }
+  };
+  driveOne(AIN1, AIN2, mA);
+  driveOne(BIN1, BIN2, mB);
+}
+
+void stopMotors() {
+  analogWrite(AIN1, 0); analogWrite(AIN2, 0);
+  analogWrite(BIN1, 0); analogWrite(BIN2, 0);
+}
+
+float readVbat() {
+  // 100k : 100k divider -> factor 2x back to pack voltage
+  // ADC: 12-bit (0..4095), reference ~3.3 V
+  uint32_t sum = 0;
+  const int N = 8; // average
+  for (int i = 0; i < N; ++i) {
+    sum += analogRead(VBAT_ADC_PIN);
+    delayMicroseconds(200);
+  }
+  float raw = sum / (float)N;
+  float v = (raw / 4095.0f) * 3.3f * 2.0f;
+  return v;
+}
+
+void applyLVC(float vbat) {
+  if (lowBatteryLockout) {
+    if (vbat >= VBAT_REARM_V) {
+      lowBatteryLockout = false; // allow rearm once above re-arm voltage
+    }
+  } else {
+    if (vbat <= VBAT_CUTOFF_V) {
+      lowBatteryLockout = true;
+      armed = false; // disarm immediately
+      stopMotors();
+    }
+  }
+}
+
+void limitThrottleForLowV(float vbat) {
+  // Optional: soft limit starting at warn voltage down to cutoff
+  if (vbat >= VBAT_WARN_V) return;
+  float k = (vbat - VBAT_CUTOFF_V) / (VBAT_WARN_V - VBAT_CUTOFF_V); // 0..1
+  k = constrain(k, 0.0f, 1.0f);
+  cmdThrL = (uint8_t)(cmdThrL * k);
+  cmdThrR = (uint8_t)(cmdThrR * k);
+}
+
+/************** Setup **************/
+void setup() {
+  // Motor pins
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  analogWriteFreq(PWM_FREQ_HZ);
+
+  // Servo
+  servo1.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  servo1.writeMicroseconds(1500);
+
+  // Battery ADC
+  pinMode(VBAT_ADC_PIN, INPUT);
+
+  // SPI pin remap for RP2040
+  SPI.setSCK(PIN_SCK);
+  SPI.setTX(PIN_MOSI);
+  SPI.setRX(PIN_MISO);
+  SPI.begin();
+
+  // Radio
+  radio.begin();
+  radio.setPALevel(RF24_PA_LOW);       // start low to avoid browning the 3V3
+  radio.setDataRate(RF24_1MBPS);
+  radio.setRetries(3, 5);              // delay,count
+  radio.enableDynamicPayloads();
+  radio.setAutoAck(true);
+  radio.openReadingPipe(1, RADIO_ADDR);
+  radio.startListening();
+
+  lastRxMs = millis();
+}
+
+/************** Main Loop **************/
+void loop() {
+  // --- RADIO RECV ---
+  if (radio.available()) {
+    RxPacket pkt; memset(&pkt, 0, sizeof(pkt));
+    while (radio.available()) {
+      radio.read(&pkt, sizeof(pkt));
+    }
+    if (pkt.crc == simpleCRC(pkt)) {
+      lastRxMs = millis();
+      // flags bit0 = arm
+      bool wantArm = pkt.flags & 0x01;
+      if (!lowBatteryLockout) armed = wantArm; else armed = false;
+
+      cmdThrL = pkt.thrL; // 0..255
+      cmdThrR = pkt.thrR;
+
+      // Servo mapping 0..255 -> 1000..2000us
+      int us = map((int)pkt.servo, 0, 255, SERVO_MIN_US, SERVO_MAX_US);
+      servo1.writeMicroseconds(us);
+    }
+  }
+
+  // --- FAILSAFE ---
+  if (millis() - lastRxMs > RADIO_TIMEOUT_MS) {
+    cmdThrL = 0; cmdThrR = 0; // throttle to zero
+    // keep servo centered during failsafe
+    servo1.writeMicroseconds(1500);
+  }
+
+  // --- BATTERY CHECK (10 Hz) ---
+  if (millis() - lastVbatReadMs >= 100) {
+    lastVbatReadMs = millis();
+    float vbat = readVbat();
+    applyLVC(vbat);
+    limitThrottleForLowV(vbat); // optional soft limit
+  }
+
+  // --- RAMP + DRIVE ---
+  if (!armed || lowBatteryLockout) {
+    pwmL = 0; pwmR = 0;
+  } else {
+    // ramp toward cmd
+    uint32_t now = millis();
+    if (now - lastRampMs >= RAMP_INTERVAL_MS) {
+      lastRampMs = now;
+      if (pwmL < cmdThrL) pwmL = min<uint8_t>(pwmL + RAMP_STEP, cmdThrL);
+      else if (pwmL > cmdThrL) pwmL = max<int>(pwmL - RAMP_STEP, cmdThrL);
+
+      if (pwmR < cmdThrR) pwmR = min<uint8_t>(pwmR + RAMP_STEP, cmdThrR);
+      else if (pwmR > cmdThrR) pwmR = max<int>(pwmR - RAMP_STEP, cmdThrR);
+    }
+  }
+
+  // Drive motors forward-only (differential thrust). If you need reverse, map around 127 midpoint.
+  setMotorAB((int)pwmL, (int)pwmR);
+}
+
+/************** Optional: Reverse Support **************/
+// If you later want bidirectional:
+// - Interpret 0..255 with 127 as stop; below -> reverse, above -> forward.
+// - Then map to -255..+255 before setMotorAB().
