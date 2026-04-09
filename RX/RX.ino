@@ -45,6 +45,7 @@ struct RCData {
 
 struct RxTelemetry {
   uint16_t rx_batt_mv;
+  uint16_t rx_batt2_mv;
   int8_t rssi;
   uint8_t flags;
   uint16_t crc;
@@ -110,6 +111,11 @@ void setMotor(int pinA, int speed) {
 }
 
 float readBatteryVoltage() {
+  uint16_t raw = analogRead(VBAT_PIN);
+  return (raw * ADC_REF / ADC_MAX) * VBAT_DIVIDER;
+}
+
+float readBattery2Voltage() {
   uint16_t raw = analogRead(VBAT2_PIN);
   return (raw * ADC_REF / ADC_MAX) * VBAT_DIVIDER;
 }
@@ -252,11 +258,13 @@ void loop() {
 
     // TELEMETRY
     telemetry.rx_batt_mv = readBatteryVoltage() * 1000;
+    telemetry.rx_batt2_mv = readBattery2Voltage() * 1000;
     Serial.println(telemetry.rx_batt_mv);
-    telemetry.rssi = 100;
+    telemetry.rssi = radio.testRPD() ? 100: 50;
     radio.writeAckPayload(0, &telemetry, sizeof(telemetry));
   }
   else {
+    telemetry.rssi = 0;
     Serial.println("Radio not available");
   }
 
