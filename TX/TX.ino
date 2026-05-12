@@ -431,7 +431,7 @@ void setup(){
   timer_ThrottleUpdate.attach_ms(20,tickThrottle);
 }
 
-// ================= LOOP =================
+// =========i:\Projects\RCPlane\NRFTest\NRFTest.ino======== LOOP =================
 
 void loop(){
 

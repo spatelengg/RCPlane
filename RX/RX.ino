@@ -13,10 +13,10 @@
 #define CSN_PIN  5
 #define CE_PIN   6
 
-#define M1_PWM 9
-#define M1_DIR 10
-#define M2_PWM 13
-#define M2_DIR 14
+#define M1_PWM 11
+//#define M1_DIR 10
+#define M2_PWM 12
+//#define M2_DIR 14
 
 #define SERVO_PIN 7
 
@@ -111,11 +111,13 @@ void setMotor(int pinA, int speed) {
 }
 
 float readBatteryVoltage() {
+  //return analogRead(VBAT_PIN);
   uint16_t raw = analogRead(VBAT_PIN);
   return (raw * ADC_REF / ADC_MAX) * VBAT_DIVIDER;
 }
 
 float readBattery2Voltage() {
+  //return analogRead(VBAT2_PIN);
   uint16_t raw = analogRead(VBAT2_PIN);
   return (raw * ADC_REF / ADC_MAX) * VBAT_DIVIDER;
 }
@@ -134,25 +136,28 @@ void setup() {
 
   statusRed();
 
+  analogWriteFreq(20000); // 25kHz
+  analogWriteRange(255);
+
   delay(5000);
 
   Serial.println("\n==== RP2040 RC RECEIVER START ====");
 
-  analogWriteFreq(20000);
+  //analogWriteFreq(20000);
 
   pinMode(VBAT_PIN, INPUT);
   pinMode(VBAT2_PIN, INPUT);
-  //analogReadResolution(12);
+  analogReadResolution(12);
 
   pinMode(M1_PWM, OUTPUT);
-  pinMode(M1_DIR, OUTPUT);
+  //pinMode(M1_DIR, OUTPUT);
   pinMode(M2_PWM, OUTPUT);
-  pinMode(M2_DIR, OUTPUT);
+  //pinMode(M2_DIR, OUTPUT);
 
   analogWrite(M1_PWM, 0);  
   analogWrite(M2_PWM, 0); 
-  digitalWrite(M1_DIR, LOW);
-  digitalWrite(M2_DIR, LOW);
+  //digitalWrite(M1_DIR, LOW);
+  //digitalWrite(M2_DIR, LOW);
 
   stopMotors();
 
@@ -259,13 +264,12 @@ void loop() {
     // TELEMETRY
     telemetry.rx_batt_mv = readBatteryVoltage() * 1000;
     telemetry.rx_batt2_mv = readBattery2Voltage() * 1000;
-    Serial.println(telemetry.rx_batt_mv);
+    //Serial.println(telemetry.rx_batt_mv);
     telemetry.rssi = radio.testRPD() ? 100: 50;
     radio.writeAckPayload(0, &telemetry, sizeof(telemetry));
   }
   else {
     telemetry.rssi = 0;
-    Serial.println("Radio not available");
   }
 
   // ================= FAILSAFE =================
